@@ -21,6 +21,8 @@ main = do
   addrInfo <- getAddrInfo Nothing (Just host) (Just port)
 
   serverSocket <- socket (addrFamily $ head addrInfo) Stream defaultProtocol
+  setSocketOption serverSocket ReuseAddr 1
+  withFdSocket serverSocket setCloseOnExecIfNeeded
   bind serverSocket $ addrAddress $ head addrInfo
   listen serverSocket 5
 
@@ -29,7 +31,10 @@ main = do
     (clientSocket, clientAddr) <- accept serverSocket
     BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr)
 
-    _ <- recv clientSocket 1024
-    _ <- send clientSocket $ BC.pack "HTTP/1.1 200 OK\r\n\r\n"
+    req <- recv clientSocket 1024
+    let response = case BC.words req of
+          (_ : "/" : _) -> "HTTP/1.1 200 OK\r\n\r\n"
+          _ -> "HTTP/1.1 404 Not Found\r\n\r\n"
+    _ <- send clientSocket response
 
     close clientSocket
