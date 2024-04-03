@@ -10,6 +10,7 @@ import Data.List (isPrefixOf)
 import Network.Socket
 import Network.Socket.ByteString (recv, send)
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import Control.Concurrent (forkIO)
 
 data HttpMethod = HttpMethodGet | HttpMethodUnknown deriving (Eq)
 
@@ -116,6 +117,13 @@ handleRequest reqStr =
       ((resVersion, resStatus), resHeaders, resBody) = withContentLength handleRoute req
    in BC.intercalate crlf [BC.unwords [showHttpVersion resVersion, showHttpStatus resStatus], BC.intercalate crlf (map concatHeader resHeaders), "", resBody]
 
+handleConnection :: Socket -> IO ()
+handleConnection soc = do
+  req <- recv soc 1024
+  let res = handleRequest req
+  _ <- send soc res
+  close soc
+
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
@@ -136,9 +144,4 @@ main = do
   forever $ do
     (clientSocket, clientAddr) <- accept serverSocket
     BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr)
-
-    req <- recv clientSocket 1024
-    let res = handleRequest req
-    _ <- send clientSocket res
-
-    close clientSocket
+    forkIO $ handleConnection clientSocket
