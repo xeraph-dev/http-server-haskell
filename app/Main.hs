@@ -16,7 +16,11 @@ import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 newtype AppState = AppState {directory :: String}
 
-data HttpMethod = HttpMethodGet | HttpMethodUnknown deriving (Eq)
+data HttpMethod
+  = HttpMethodGet
+  | HttpMethodPost
+  | HttpMethodUnknown
+  deriving (Eq)
 
 crlf :: BC.ByteString
 crlf = "\r\n"
@@ -29,6 +33,7 @@ splitBy sep bs = line : splitBy sep (BC.drop (BC.length sep) rest)
 
 parseHttpMethod :: BC.ByteString -> HttpMethod
 parseHttpMethod "GET" = HttpMethodGet
+parseHttpMethod "POST" = HttpMethodPost
 parseHttpMethod method = error $ "Invalid http method: " <> BC.unpack method
 
 instance Show HttpMethod where
@@ -36,6 +41,7 @@ instance Show HttpMethod where
 
 showHttpMethod :: HttpMethod -> BC.ByteString
 showHttpMethod HttpMethodGet = "GET"
+showHttpMethod HttpMethodPost = "POST"
 showHttpMethod HttpMethodUnknown = "UNKNOWN"
 
 data HttpVersion = HttpVersion1_1 | HttpVersionUnknown
@@ -51,10 +57,11 @@ showHttpVersion HttpVersionUnknown = error "Cannot show the unknown http version
 instance Show HttpVersion where
   show = BC.unpack . showHttpVersion
 
-data HttpStatus = HttpStatusOk | HttpStatusNotFound
+data HttpStatus = HttpStatusOk | HttpStatusCreated | HttpStatusNotFound
 
 showHttpStatus :: HttpStatus -> BC.ByteString
 showHttpStatus HttpStatusOk = "200 OK"
+showHttpStatus HttpStatusCreated = "201 Created"
 showHttpStatus HttpStatusNotFound = "404 Not Found"
 
 instance Show HttpStatus where
@@ -90,7 +97,7 @@ withContentLength state handler req = do
   return (status, contentLength : headers, body)
 
 handleRoute :: AppState -> HttpRequest -> IO HttpResponse
-handleRoute state ((method, path, version), headers, _)
+handleRoute state ((method, path, version), headers, body)
   | method == HttpMethodGet && [""] `isPrefixOf` path = return ((version, HttpStatusOk), [], "")
   | method == HttpMethodGet && ["echo"] `isPrefixOf` path = return ((version, HttpStatusOk), [textPlain], BC.intercalate "/" $ tail path)
   | method == HttpMethodGet && ["user-agent"] `isPrefixOf` path = return ((version, HttpStatusOk), [textPlain], snd $ getHttpHeader headers "User-Agent")
@@ -99,6 +106,9 @@ handleRoute state ((method, path, version), headers, _)
       return $ case file of
         Just content -> ((version, HttpStatusOk), [octetStream], content)
         Nothing -> ((version, HttpStatusNotFound), [], "")
+  | method == HttpMethodPost && ["files"] `isPrefixOf` path = do
+      writeContentToFile state (BC.intercalate "/" $ tail path) body
+      return ((version, HttpStatusCreated), [octetStream], "")
   | otherwise = return ((version, HttpStatusNotFound), [], "")
   where
     textPlain = ("Content-Type", "text/plain")
@@ -115,10 +125,10 @@ parseRequestHeader [] = error "Invalid http request header"
 
 parseRequest :: (HttpRequest, Bool) -> BC.ByteString -> (HttpRequest, Bool)
 parseRequest (req@(status@(method, _, _), headers, body), found) line
-  | line == "" = (req, True)
+  | not found && line == "" = (req, not found)
   | method == HttpMethodUnknown = ((parseRequestStatus $ BC.words line, headers, body), found)
   | not found = ((status, parseRequestHeader (BC.words line) : headers, body), found)
-  | found = ((status, headers, body <> crlf <> line), found)
+  | found = ((status, headers, (if BC.null body then body else body <> crlf) <> line), found)
   | otherwise = error $ "Invalid request line: " <> BC.unpack line
 
 handleRequest :: AppState -> BC.ByteString -> IO BC.ByteString
@@ -140,6 +150,10 @@ getFileContent state path = do
   return $ case contents of
     Left _ -> Nothing
     Right content -> Just content
+
+writeContentToFile :: AppState -> BC.ByteString -> BC.ByteString -> IO ()
+writeContentToFile state path content = do
+  BC.writeFile (directory state <> "/" <> BC.unpack path) content
 
 main :: IO ()
 main = do
