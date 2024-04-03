@@ -2,6 +2,8 @@
 
 module Main (main) where
 
+import Control.Concurrent (forkIO)
+import Control.Exception
 import Control.Monad (forever)
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
@@ -9,8 +11,10 @@ import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.List (isPrefixOf)
 import Network.Socket
 import Network.Socket.ByteString (recv, send)
+import System.Environment (getArgs)
 import System.IO (BufferMode (..), hSetBuffering, stdout)
-import Control.Concurrent (forkIO)
+
+newtype AppState = AppState {directory :: String}
 
 data HttpMethod = HttpMethodGet | HttpMethodUnknown deriving (Eq)
 
@@ -71,28 +75,34 @@ type HttpResponse = (HttpResponseStatus, [HttpHeader], HttpBody)
 concatHeader :: (BC.ByteString, BC.ByteString) -> BC.ByteString
 concatHeader (key, value) = key <> ": " <> value
 
-getHeader :: [HttpHeader] -> BC.ByteString -> HttpHeader
-getHeader [] _ = ("", "")
-getHeader headers key
+getHttpHeader :: [HttpHeader] -> BC.ByteString -> HttpHeader
+getHttpHeader [] _ = ("", "")
+getHttpHeader headers key
   | fst header == key = header
-  | otherwise = getHeader (tail headers) key
+  | otherwise = getHttpHeader (tail headers) key
   where
     header = head headers
 
-withContentLength :: (HttpRequest -> HttpResponse) -> HttpRequest -> HttpResponse
-withContentLength handler req = case handler req of
-  (status, headers, body) -> (status, contentLength : headers, body)
-    where
-      contentLength = ("Content-Length", BLC.toStrict . BB.toLazyByteString . BB.intDec $ BC.length body)
+withContentLength :: AppState -> (AppState -> HttpRequest -> IO HttpResponse) -> HttpRequest -> IO HttpResponse
+withContentLength state handler req = do
+  (status, headers, body) <- handler state req
+  let contentLength = ("Content-Length", BLC.toStrict . BB.toLazyByteString . BB.intDec $ BC.length body)
+  return (status, contentLength : headers, body)
 
-handleRoute :: HttpRequest -> HttpResponse
-handleRoute ((method, path, version), headers, _)
-  | method == HttpMethodGet && [""] `isPrefixOf` path = ((version, HttpStatusOk), [], "")
-  | method == HttpMethodGet && ["echo"] `isPrefixOf` path = ((version, HttpStatusOk), [contentType], BC.intercalate "/" $ tail path)
-  | method == HttpMethodGet && ["user-agent"] `isPrefixOf` path = ((version, HttpStatusOk), [contentType], snd $ getHeader headers "User-Agent")
-  | otherwise = ((version, HttpStatusNotFound), [], "")
+handleRoute :: AppState -> HttpRequest -> IO HttpResponse
+handleRoute state ((method, path, version), headers, _)
+  | method == HttpMethodGet && [""] `isPrefixOf` path = return ((version, HttpStatusOk), [], "")
+  | method == HttpMethodGet && ["echo"] `isPrefixOf` path = return ((version, HttpStatusOk), [textPlain], BC.intercalate "/" $ tail path)
+  | method == HttpMethodGet && ["user-agent"] `isPrefixOf` path = return ((version, HttpStatusOk), [textPlain], snd $ getHttpHeader headers "User-Agent")
+  | method == HttpMethodGet && ["files"] `isPrefixOf` path = do
+      file <- getFileContent state . BC.intercalate "/" $ tail path
+      return $ case file of
+        Just content -> ((version, HttpStatusOk), [octetStream], content)
+        Nothing -> ((version, HttpStatusNotFound), [], "")
+  | otherwise = return ((version, HttpStatusNotFound), [], "")
   where
-    contentType = ("Content-Type", "text/plain")
+    textPlain = ("Content-Type", "text/plain")
+    octetStream = ("Content-Type", "application/octet-stream")
 
 parseRequestStatus :: [BC.ByteString] -> HttpRequestStatus
 parseRequestStatus [method, path, version] = (parseHttpMethod method, tail $ BC.split '/' path, parseHttpVersion version)
@@ -111,21 +121,35 @@ parseRequest (req@(status@(method, _, _), headers, body), found) line
   | found = ((status, headers, body <> crlf <> line), found)
   | otherwise = error $ "Invalid request line: " <> BC.unpack line
 
-handleRequest :: BC.ByteString -> BC.ByteString
-handleRequest reqStr =
+handleRequest :: AppState -> BC.ByteString -> IO BC.ByteString
+handleRequest state reqStr = do
   let (req, _) = foldl parseRequest (((HttpMethodUnknown, [], HttpVersionUnknown), [], ""), False) $ splitBy crlf reqStr
-      ((resVersion, resStatus), resHeaders, resBody) = withContentLength handleRoute req
-   in BC.intercalate crlf [BC.unwords [showHttpVersion resVersion, showHttpStatus resStatus], BC.intercalate crlf (map concatHeader resHeaders), "", resBody]
+  ((resVersion, resStatus), resHeaders, resBody) <- withContentLength state handleRoute req
+  return $ BC.intercalate crlf [BC.unwords [showHttpVersion resVersion, showHttpStatus resStatus], BC.intercalate crlf (map concatHeader resHeaders), "", resBody]
 
-handleConnection :: Socket -> IO ()
-handleConnection soc = do
+handleConnection :: AppState -> Socket -> IO ()
+handleConnection state soc = do
   req <- recv soc 1024
-  let res = handleRequest req
+  res <- handleRequest state req
   _ <- send soc res
   close soc
 
+getFileContent :: AppState -> BC.ByteString -> IO (Maybe BC.ByteString)
+getFileContent state path = do
+  contents <- try (BC.readFile $ directory state <> "/" <> BC.unpack path) :: IO (Either SomeException BC.ByteString)
+  return $ case contents of
+    Left _ -> Nothing
+    Right content -> Just content
+
 main :: IO ()
 main = do
+  args <- getArgs
+
+  let state =
+        AppState
+          { directory = if length args >= 2 && head args == "--directory" then args !! 1 else ""
+          }
+
   hSetBuffering stdout LineBuffering
 
   let host = "127.0.0.1"
@@ -144,4 +168,4 @@ main = do
   forever $ do
     (clientSocket, clientAddr) <- accept serverSocket
     BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr)
-    forkIO $ handleConnection clientSocket
+    forkIO $ handleConnection state clientSocket
